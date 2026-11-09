@@ -16,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -32,17 +32,20 @@ INSTRUCTIONS = """\
 You are a learning support agent for the AI Engineering Pilot Course (AIE2026).
 - Always check the glossary with search_glossary before answering about terms or course-specific information.
 - Use get_lecture_summary when asked about the content of a session.
+- Use make_quiz when asked for a review question or quiz about a lecture session.
+- Use save_learning_log when asked to record or save learning notes, summaries, or reflections.
+- If a tool call requiring approval is denied by the user, respect the user's decision and do not retry calling that tool; inform the user that the operation was canceled.
 - If something is absent from the glossary, say "It is not in the glossary" instead of making assertions based on guesses.
 - End your answer by indicating the relevant session (Lecture NN).
 - Guide learners with hints on how to think, rather than writing homework answers for them.
 """
 
 # Pass the model at runtime (so tests can substitute TestModel without calling an API)
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(instructions=INSTRUCTIONS, output_type=[str, DeferredToolRequests])
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
-
-# TODO(Lecture 03 exercise): create make_quiz in tools.py and register it here
+agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # Lecture 05: MCP server configuration file. Uses the same "mcpServers" format as Claude Desktop and Cursor
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -74,7 +77,7 @@ def load_mcp_servers(config_path: Path = MCP_CONFIG) -> list[MCPToolset]:
 
 def build_mcp_agent(config_path: Path = MCP_CONFIG) -> Agent:
     """Lecture 05: an agent using tools exposed by MCP servers instead of directly registered functions. INSTRUCTIONS stays the same."""
-    return Agent(instructions=INSTRUCTIONS, toolsets=load_mcp_servers(config_path))
+    return Agent(instructions=INSTRUCTIONS, toolsets=load_mcp_servers(config_path), output_type=[str, DeferredToolRequests])
 
 
 def build_model() -> GoogleModel:
@@ -128,8 +131,30 @@ def main() -> None:
     print(f"[model] {MODEL}")
     if args.mcp:
         print("[tools] MCP servers (app/mcp_servers.json)")
+    model = build_model()
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = target.run_sync(args.question, model=model)
+        while isinstance(result.output, DeferredToolRequests):
+            approvals: dict[str, bool] = {}
+            for call in result.output.approvals:
+                print(f"\n[approval required] Tool '{call.tool_name}' requests execution.")
+                print(f"  Arguments: {json.dumps(call.args, ensure_ascii=False, indent=2)}")
+                try:
+                    choice = input(f"Allow '{call.tool_name}' to proceed? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    choice = "n"
+                approved = choice in ("y", "yes")
+                approvals[call.tool_call_id] = approved
+                if approved:
+                    print(f"  -> Approved '{call.tool_name}'.")
+                else:
+                    print(f"  -> Denied '{call.tool_name}'.")
+            deferred_results = result.output.build_results(approvals=approvals)
+            result = target.run_sync(
+                message_history=result.all_messages(),
+                deferred_tool_results=deferred_results,
+                model=model,
+            )
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
