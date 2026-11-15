@@ -24,7 +24,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.google import GoogleModel
@@ -52,7 +52,7 @@ Verdict = Literal["pass", "fail", "unsure"]
 
 
 class CriterionVerdict(BaseModel):
-    """Judgment for one criterion. Request reason before verdict (reason → judgment)."""
+    """Judgment for one criterion. Request reason before verdict (reason -> judgment)."""
 
     reason: str = Field(description="Reason for the judgment, in one or two English sentences")
     verdict: Verdict = Field(description="One of pass / fail / unsure")
@@ -79,7 +79,7 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def load_labels(path: Path) -> dict[str, dict]:
-    """Convert a label file (one record per line) to an id → label dictionary. Later lines take precedence for duplicate IDs."""
+    """Convert a label file (one record per line) to an id -> label dictionary. Later lines take precedence for duplicate IDs."""
     return {row["id"]: row for row in read_jsonl(path)}
 
 
@@ -133,7 +133,7 @@ def _rule_based_judge(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
     """A fake model that uses simple rules to check the workflow without API calls.
 
     Judges using only the question and answer strings. It cannot replace a real LLM, but
-    lets you check the grading → agreement → human review workflow without an API key.
+    lets you check the grading -> agreement -> human review workflow without an API key.
     """
     prompt, rubric = "", ""
     for m in messages:
@@ -148,7 +148,7 @@ def _rule_based_judge(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
         return {"reason": reason, "verdict": verdict}
 
     if "The glossary" in a and ("does not contain" in a or "does not list" in a) and "In general" in a:
-        # Follow any policy added under Grounding in STEP 3 (... (pass) → pass, ... (fail) → fail)
+        # Follow any policy added under Grounding in STEP 3 (... (pass) -> pass, ... (fail) -> fail)
         if re.search(r"general.*\(pass\)", rubric):
             grounding = v("Under the added policy, a general explanation after stating that the term is absent from the glossary is not an unsupported assertion", "pass")
         elif re.search(r"general.*\(fail\)", rubric):
@@ -189,17 +189,28 @@ def build_test_model() -> FunctionModel:
 
 # ---------------------------------------------------------------- Grading and aggregation
 def judge_cases(agent: Agent, cases: list[dict], wait: float = 0.0) -> dict[str, dict]:
-    """Grade the evaluation set one case at a time. Return id → {criterion: {reason, verdict}}."""
+    """Grade the evaluation set one case at a time. Return id -> {criterion: {reason, verdict}}."""
     verdicts: dict[str, dict] = {}
     print(f"Grading {len(cases)} cases ", end="", flush=True)
     for case in cases:
-        result = agent.run_sync(judge_prompt(case))
-        out: JudgeResult = result.output
-        verdicts[case["id"]] = {key: getattr(out, key).model_dump() for key, _ in LLM_CRITERIA}
-        verdicts[case["id"]]["lecture_mark"] = {
-            "reason": "Code checks for a Lecture N marker in the final line",
-            "verdict": check_lecture_mark(case["answer"]),
-        }
+        for attempt in range(5):
+            try:
+                result = agent.run_sync(judge_prompt(case))
+                out: JudgeResult = result.output
+                verdicts[case["id"]] = {key: getattr(out, key).model_dump() for key, _ in LLM_CRITERIA}
+                verdicts[case["id"]]["lecture_mark"] = {
+                    "reason": "Code checks for a Lecture N marker in the final line",
+                    "verdict": check_lecture_mark(case["answer"]),
+                }
+                break
+            except (ModelHTTPError, ModelAPIError) as e:
+                status = getattr(e, "status_code", 503)
+                if status in (429, 503) and attempt < 4:
+                    backoff = (attempt + 1) * 5
+                    print(f"\n[{type(e).__name__} - retrying in {backoff}s]", end="", flush=True)
+                    time.sleep(backoff)
+                else:
+                    raise
         print(".", end="", flush=True)
         if wait:
             time.sleep(wait)
@@ -308,8 +319,19 @@ def generate_answers(cases: list[dict], wait: float = 1.0) -> list[dict]:
     model = build_model()
     print(f"Generating answers for {len(cases)} cases ", end="", flush=True)
     for case in cases:
-        result = agent.run_sync(case["question"], model=model)
-        case["answer"] = str(result.output)
+        for attempt in range(5):
+            try:
+                result = agent.run_sync(case["question"], model=model)
+                case["answer"] = str(result.output)
+                break
+            except (ModelHTTPError, ModelAPIError) as e:
+                status = getattr(e, "status_code", 503)
+                if status in (429, 503) and attempt < 4:
+                    backoff = (attempt + 1) * 5
+                    print(f"\n[{type(e).__name__} - retrying in {backoff}s]", end="", flush=True)
+                    time.sleep(backoff)
+                else:
+                    raise
         print(".", end="", flush=True)
         time.sleep(wait)
     print()
@@ -348,7 +370,7 @@ def main(argv: list[str] | None = None) -> None:
             print(api_error_message(e.status_code, str(e.body)[:200]))
             raise SystemExit(1)
         write_jsonl(args.cases, cases)
-        print(f"→ Wrote answers to {args.cases}. Next, label them with tools/annotate.py")
+        print(f"-> Wrote answers to {args.cases}. Next, label them with tools/annotate.py")
         return
 
     if not args.labels.exists():
@@ -387,7 +409,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
         encoding="utf-8",
     )
-    print(f"\n→ Saved to {_rel(args.out)}")
+    print(f"\n-> Saved to {_rel(args.out)}")
 
 
 if __name__ == "__main__":
