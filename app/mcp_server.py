@@ -27,8 +27,12 @@ server = MCPServer(
 # Expose the same function as in Lecture 03 as an MCP tool. Its docstring and type hints become the description
 server.tool()(tools.search_glossary)
 
-# TODO(Lecture 05 exercise): expose tools.get_lecture_summary too (the same form as the line above)
-# If you created make_quiz in Lecture 03, you can expose it too
+# Lecture 05 exercise: expose get_lecture_summary through MCP
+server.tool()(tools.get_lecture_summary)
+
+# Advanced: expose make_quiz and search_related for learning support and concept graph exploration
+server.tool()(tools.make_quiz)
+server.tool()(tools.search_related)
 
 
 def main() -> None:

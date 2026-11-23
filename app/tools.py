@@ -1,10 +1,15 @@
-"""Lecture 03: tools for the agent.
+"""Lecture 03 / 05: tools for the agent.
 
 Function docstrings and type hints here become the "tool descriptions" presented to the model.
 Rewriting descriptions changes whether the model uses a tool and which arguments it supplies.
+
+Lecture 05 Advanced additions:
+- make_quiz: generate a multiple-choice quiz question from a glossary term.
+- search_related: follow glossary relationship links to find connected concepts.
 """
 
 import json
+import random
 from functools import cache
 from pathlib import Path
 
@@ -77,3 +82,95 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"Key points for Lecture {lecture:02d} are not available yet. Available sessions: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+
+def make_quiz(term: str, num_choices: int = 4) -> str:
+    """Generate a multiple-choice quiz question for a glossary term.
+
+    Creates one question with distractors drawn from other glossary entries.
+    Use when the learner wants to self-test on a specific concept.
+    num_choices must be between 2 and 6.
+    """
+    if num_choices < 2 or num_choices > 6:
+        return "num_choices must be between 2 and 6."
+
+    glossary = load_glossary()
+    q_norm = _normalize(term)
+    matches = [e for e in glossary if q_norm in _names(e)]
+    if not matches:
+        return f"The term '{term}' was not found in the glossary. Cannot generate a quiz."
+
+    target = matches[0]
+    # Distractors: other entries in the same lecture or any other lecture
+    pool = [e for e in glossary if e["id"] != target["id"]]
+    num_distractors = min(num_choices - 1, len(pool))
+    distractors = random.sample(pool, num_distractors)
+
+    choices = [{"label": "A", "text": target["definition"], "correct": True}]
+    labels = ["B", "C", "D", "E", "F"]
+    for i, d in enumerate(distractors):
+        choices.append({"label": labels[i], "text": d["definition"], "correct": False})
+
+    random.shuffle(choices)
+    for i, c in enumerate(choices):
+        c["label"] = chr(ord("A") + i)
+
+    correct_label = next(c["label"] for c in choices if c["correct"])
+
+    return json.dumps(
+        {
+            "question": f"Which of the following best describes '{target['term']}'?",
+            "choices": [{"label": c["label"], "text": c["text"]} for c in choices],
+            "answer": correct_label,
+            "explanation": f"See Lecture {target['lecture']}: {target['definition']}",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def search_related(term: str, hops: int = 1) -> str:
+    """Follow 'related' links in the glossary to find concepts connected to the given term.
+
+    Use when asked about relationships between concepts or when a single glossary entry
+    is not enough — this walks the relationship graph up to `hops` steps (1–3).
+    Returns each discovered term with its definition and lecture number.
+    """
+    if hops < 1 or hops > 3:
+        return "hops must be between 1 and 3."
+
+    glossary = load_glossary()
+    index = {e["id"]: e for e in glossary}
+
+    q_norm = _normalize(term)
+    seeds = [e for e in glossary if q_norm in _names(e)]
+    if not seeds:
+        return f"The term '{term}' was not found in the glossary."
+
+    visited: dict[str, dict] = {}
+    frontier = {seeds[0]["id"]}
+
+    for _ in range(hops):
+        next_frontier: set[str] = set()
+        for node_id in frontier:
+            if node_id in visited or node_id not in index:
+                continue
+            entry = index[node_id]
+            visited[node_id] = entry
+            for related_id in entry.get("related", []):
+                if related_id not in visited:
+                    next_frontier.add(related_id)
+        frontier = next_frontier
+
+    results = [
+        {
+            "term": e["term"],
+            "lecture": e["lecture"],
+            "definition": e["definition"],
+            "distance_hops": "seed" if e["id"] == seeds[0]["id"] else "related",
+        }
+        for e in visited.values()
+    ]
+    if not results:
+        return f"No related terms found for '{term}'."
+    return json.dumps(results, ensure_ascii=False, indent=2)
